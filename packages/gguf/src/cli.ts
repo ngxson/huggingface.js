@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { GGMLQuantizationType, gguf, ggufAllShards, GGUFParseOutput } from ".";
+import { estimateRuntimeRequirement } from "./estimator";
 import { GGML_QUANT_SIZES } from "./quant-descriptions";
 
 interface PrintColumnHeader {
@@ -79,28 +80,33 @@ async function main() {
 	console.log();
 	console.log(`* Memory usage estimation (with context length of ${nCtx} tokens)`);
 	try {
-		const kvUsage = calcMemoryUsage(metadata as GGUFParseOutput<{ strict: false }>["metadata"], nCtx);
-		let modelWeightInBytes = 0;
-		for (const tensorInfo of tensorInfos) {
-			const nElem = Number(tensorInfo.shape.reduce((a, b) => a * b, 1n));
-			const tensorSizeInBytes = nElem * (GGML_QUANT_SIZES[tensorInfo.dtype] / 8);
-			modelWeightInBytes += tensorSizeInBytes;
-		}
-		const overhead =
-			calcMemoryUsage(metadata as GGUFParseOutput<{ strict: false }>["metadata"], 256).totalBytes +
-			modelWeightInBytes * 0.05;
-		const totalMemoryUsage = kvUsage.totalBytes + overhead + modelWeightInBytes;
+		const estimation = estimateRuntimeRequirement(
+			{
+				kvTypeK: GGMLQuantizationType.F16,
+				kvTypeV: GGMLQuantizationType.F16,
+			},
+			metadata as GGUFParseOutput<{ strict: false }>["metadata"],
+			tensorInfos
+		)
+		const kvUsageMB = estimation.memory.perToken * nCtx;
+		const modelWeightMB = estimation.memory.weight;
+		const totalMemoryUsage = kvUsageMB + modelWeightMB;
+		const batchMB = estimation.memory.perToken * 256 + totalMemoryUsage;
+		const overheadMB = batchMB + modelWeightMB * 0.05;
 		printTable(
 			[{ name: "Item" }, { name: "Memory usage", alignRight: true }],
 			[
-				["K cache", (kvUsage.totalBytesK / 1e9).toFixed(2) + " GB"],
-				["V cache", (kvUsage.totalBytesV / 1e9).toFixed(2) + " GB"],
-				["Weight", (modelWeightInBytes / 1e9).toFixed(2) + " GB"],
-				["Overhead", (overhead / 1e9).toFixed(2) + " GB"],
+				["KV cache", (kvUsageMB / 1e6).toFixed(2) + " GB"],
+				["Weight", (modelWeightMB / 1e6).toFixed(2) + " GB"],
+				["Overhead", (overheadMB / 1e6).toFixed(2) + " GB"],
 				["", "---"],
-				["TOTAL", (totalMemoryUsage / 1e9).toFixed(2) + " GB"],
+				["TOTAL", (totalMemoryUsage / 1e6).toFixed(2) + " GB"],
 			]
 		);
+
+		console.log();
+		const teraOps = estimation.compute.gFloatOps / 1000;
+		console.log(`* Compute usage estimation: ${teraOps.toFixed(2)} Tera floating point operations per token`);
 	} catch (e) {
 		console.error(`Error: ${(e as Error).message}`);
 	}
@@ -134,53 +140,6 @@ async function main() {
 		console.log();
 		console.log(`* Use --show-tensor to display tensor information`);
 	}
-}
-
-function calcMemoryUsage(
-	metadata: GGUFParseOutput<{ strict: false }>["metadata"],
-	kvSize: number,
-	kvTypeK: GGMLQuantizationType = GGMLQuantizationType.F16,
-	kvTypeV: GGMLQuantizationType = GGMLQuantizationType.F16
-) {
-	const arch = metadata["general.architecture"] ?? "unknown";
-	const n_embd = (metadata[`${arch}.embedding_length`] as number) ?? 0;
-	const n_head = (metadata[`${arch}.attention.head_count`] as number) ?? 0;
-	const n_embd_head_k = (metadata[`${arch}.attention.key_length`] as number) ?? n_embd / n_head;
-	const n_embd_head_v = (metadata[`${arch}.attention.value_length`] as number) ?? n_embd / n_head;
-	const n_head_kv = (metadata[`${arch}.attention.head_count_kv`] as number[] | number) ?? [];
-	const n_layer = (metadata[`${arch}.block_count`] as number) ?? 0;
-
-	if (arch.startsWith("mamba") || arch.startsWith("rwkv")) {
-		throw new Error(`Memory usage estimation for arch "${arch}" is not supported`);
-	}
-
-	const n_head_kv_arr = Array(n_layer).fill(n_head);
-	if (Array.isArray(n_head_kv)) {
-		for (let i = 0; i < n_layer; i++) {
-			if (n_head_kv[i]) {
-				n_head_kv_arr[i] = n_head_kv[i];
-			}
-		}
-	} else {
-		for (let i = 0; i < n_layer; i++) {
-			n_head_kv_arr[i] = n_head_kv;
-		}
-	}
-
-	let totalElemsK = 0;
-	let totalElemsV = 0;
-	for (let i = 0; i < n_layer; i++) {
-		const n_embd_k_gqa = n_embd_head_k * n_head_kv_arr[i];
-		const n_embd_v_gqa = n_embd_head_v * n_head_kv_arr[i];
-		totalElemsK += n_embd_k_gqa * kvSize;
-		totalElemsV += n_embd_v_gqa * kvSize;
-	}
-
-	return {
-		totalBytesK: totalElemsK * (GGML_QUANT_SIZES[kvTypeK] / 8),
-		totalBytesV: totalElemsV * (GGML_QUANT_SIZES[kvTypeV] / 8),
-		totalBytes: (totalElemsK + totalElemsV) * (GGML_QUANT_SIZES[kvTypeV] / 8),
-	};
 }
 
 function printTable(header: PrintColumnHeader[], rows: string[][], leftPad = 2) {
